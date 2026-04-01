@@ -260,21 +260,22 @@ app.get('/', (req, res) => res.type('html').send(HTML));
 app.get('/manifest.json', (req, res) => res.json({
   id:          'com.spotiflac.eclipse',
   name:        'SpotiFLAC',
-  version:     '5.1.0',
+  version:     '5.2.0',
   description: 'Deezer search + TIDAL FLAC via Claudochrome',
   // FIX: resources as array of objects instead of strings.
   // Android Eclipse uses Gson which strictly expects objects here,
   // while iOS was lenient enough to accept plain strings.
+  // Android Eclipse (Gson) requires objects with a 'name' key — plain strings cause a parse error
   resources: [
-    { id: 'search'  },
-    { id: 'stream'  },
-    { id: 'catalog' },
+    { name: 'search'  },
+    { name: 'stream'  },
+    { name: 'catalog' },
   ],
   types: [
-    { id: 'track'    },
-    { id: 'album'    },
-    { id: 'artist'   },
-    { id: 'playlist' },
+    { name: 'track'    },
+    { name: 'album'    },
+    { name: 'artist'   },
+    { name: 'playlist' },
   ],
 }));
 
@@ -403,12 +404,12 @@ app.get('/health', async (req, res) => {
     await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
     claudoOk = true;
   } catch (e) { error = e.message; }
-  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.1.0' });
+  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.2.0' });
 });
 
 // ─── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`SpotiFLAC v5.1.0 → http://localhost:${PORT}`);
+  console.log(`SpotiFLAC v5.2.0 → http://localhost:${PORT}`);
   console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
 
   if (process.env.RENDER_EXTERNAL_URL) {

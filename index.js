@@ -138,6 +138,13 @@ function fmtPlaylist(p) {
 }
 
 // ─────────────────────────────────────────────
+//  GET / — serve website explicitly
+// ─────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ─────────────────────────────────────────────
 //  GET /manifest.json
 // ─────────────────────────────────────────────
 app.get('/manifest.json', (req, res) => {

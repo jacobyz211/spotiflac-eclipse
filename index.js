@@ -86,32 +86,26 @@ function pLimit(concurrency) {
 }
 
 // ─── Enrich detail-endpoint tracks with pre-resolved stream URLs ──
-// Uses cache when available (instant). For uncached tracks, resolves
-// up to `concurrency` at a time so Eclipse gets streamURL stored
-// alongside the track in playlists/library — preventing addon loss.
 async function enrichTracksWithStreams(tracks, concurrency = 3) {
   const limit = pLimit(concurrency);
   return Promise.all(tracks.map(track =>
     limit(async () => {
       const dzId = track.id.replace(/^dz_/, '');
       try {
-        // Instant path: already cached
         const cached = streamCache.get(dzId);
         if (cached && cached.expiresAt > Date.now()) {
           return { ...track, streamURL: cached.url };
         }
-        // Need meta to resolve — only proceed if we have it cached
         const meta = trackMetaCache.get(dzId);
-        if (!meta) return track; // no meta yet, skip quietly
+        if (!meta) return track;
 
-        // Race against 4s so detail endpoints don't time out
         const result = await Promise.race([
           resolveStream(dzId, meta.title, meta.artist),
           new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
         ]);
         return { ...track, streamURL: result.url };
       } catch {
-        return track; // graceful fallback — Eclipse will call /stream/:id
+        return track;
       }
     })
   ));
@@ -119,7 +113,6 @@ async function enrichTracksWithStreams(tracks, concurrency = 3) {
 
 // ─── Format helpers ───────────────────────────────────────────
 function fmtTrack(t, albumName, albumCover) {
-  // Populate trackMetaCache so /stream/:id never needs to call Deezer
   const dzId = String(t.id);
   if (!trackMetaCache.has(dzId)) {
     trackMetaCache.set(dzId, {
@@ -267,10 +260,22 @@ app.get('/', (req, res) => res.type('html').send(HTML));
 app.get('/manifest.json', (req, res) => res.json({
   id:          'com.spotiflac.eclipse',
   name:        'SpotiFLAC',
-  version:     '5.0.0',
+  version:     '5.1.0',
   description: 'Deezer search + TIDAL FLAC via Claudochrome',
-  resources:   ['search', 'stream', 'catalog'],
-  types:       ['track', 'album', 'artist', 'playlist'],
+  // FIX: resources as array of objects instead of strings.
+  // Android Eclipse uses Gson which strictly expects objects here,
+  // while iOS was lenient enough to accept plain strings.
+  resources: [
+    { id: 'search'  },
+    { id: 'stream'  },
+    { id: 'catalog' },
+  ],
+  types: [
+    { id: 'track'    },
+    { id: 'album'    },
+    { id: 'artist'   },
+    { id: 'playlist' },
+  ],
 }));
 
 app.get('/search', async (req, res) => {
@@ -296,8 +301,6 @@ app.get('/search', async (req, res) => {
 });
 
 // ─── Stream resolution ────────────────────────────────────────
-// FIX: uses trackMetaCache first — eliminates the extra Deezer API
-// call that was the #1 cause of timeout-induced playlist source loss.
 app.get('/stream/:id', async (req, res) => {
   const dzId = req.params.id.replace(/^dz_/, '');
   try {
@@ -307,7 +310,6 @@ app.get('/stream/:id', async (req, res) => {
     if (metaCached) {
       ({ title, artist } = metaCached);
     } else {
-      // Cold fallback: track was never seen in a search — fetch from Deezer
       const track = await deezerGet(`/track/${dzId}`);
       title  = track.title;
       artist = track.artist?.name || '';
@@ -323,9 +325,6 @@ app.get('/stream/:id', async (req, res) => {
 });
 
 // ─── Album details ────────────────────────────────────────────
-// FIX: enrichTracksWithStreams attaches streamURL to tracks so Eclipse
-// stores the addon + stream reference when users save album tracks to
-// playlists, preventing the "blank / no addon logo" bug on restart.
 app.get('/album/:id', async (req, res) => {
   const rawId = req.params.id.replace(/^dz_/, '');
   try {
@@ -404,16 +403,14 @@ app.get('/health', async (req, res) => {
     await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
     claudoOk = true;
   } catch (e) { error = e.message; }
-  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.0.0' });
+  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.1.0' });
 });
 
 // ─── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`SpotiFLAC v5 → http://localhost:${PORT}`);
+  console.log(`SpotiFLAC v5.1.0 → http://localhost:${PORT}`);
   console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
 
-  // Keep Render's free tier warm so Eclipse stream requests never hit a
-  // cold start (cold starts cause timeout → Eclipse drops the addon source).
   if (process.env.RENDER_EXTERNAL_URL) {
     const selfUrl = process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
     setInterval(async () => {
@@ -423,6 +420,6 @@ app.listen(PORT, () => {
       } catch (e) {
         console.warn('[keepalive] ping failed:', e.message);
       }
-    }, 4 * 60 * 1000); // every 4 minutes
+    }, 4 * 60 * 1000);
   }
 });

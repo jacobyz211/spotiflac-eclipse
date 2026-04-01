@@ -199,8 +199,8 @@
 <!-- HERO -->
 <section class="hero">
   <p class="hero-eyebrow">Eclipse Music · Community Addon</p>
-  <h1 class="hero-title">Spotify search.<br/><span>FLAC quality.</span></h1>
-  <p class="hero-sub">Search the entire Spotify catalog inside Eclipse. Every track resolves to a lossless FLAC stream via TidalFi — no account required.</p>
+  <h1 class="hero-title">Deezer search.<br/><span>FLAC quality.</span></h1>
+  <p class="hero-sub">Search 90M+ tracks via Deezer's free public API inside Eclipse. Every result resolves to a lossless FLAC stream via TidalFi. No account, no API key, nothing.</p>
   <div id="statusPill" class="status-pill" onclick="checkHealth()" title="Click to refresh">
     <div class="status-dot" id="statusDot"></div>
     <span class="status-label" id="statusLabel">Checking…</span>
@@ -249,8 +249,8 @@
     <div class="feature-icon">
       <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
     </div>
-    <div class="feature-title">Full Spotify catalog</div>
-    <div class="feature-desc">Search tracks, albums, artists, and playlists — everything Spotify indexes, including new releases.</div>
+    <div class="feature-title">Full Deezer catalog</div>
+    <div class="feature-desc">90M+ tracks. Search tracks, albums, artists, and playlists — all from Deezer's completely free, no-auth public API.</div>
   </div>
   <div class="feature-card">
     <div class="feature-icon">
@@ -264,7 +264,7 @@
       <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
     <div class="feature-title">No account needed</div>
-    <div class="feature-desc">Uses an anonymous Spotify token for search. No login, no credentials, no rate-limit keys to manage.</div>
+    <div class="feature-desc">Deezer's public API requires zero auth. No login, no API key, no credentials — it just works out of the box.</div>
   </div>
   <div class="feature-card">
     <div class="feature-icon">
@@ -312,7 +312,7 @@
 </section>
 
 <footer>
-  SpotiFLAC Eclipse Addon — Spotify search · FLAC via TidalFi · No account required
+  SpotiFLAC Eclipse Addon — Deezer search · FLAC via TidalFi · No account, no API key required
 </footer>
 
 <script>
@@ -343,12 +343,12 @@
     try {
       const res  = await fetch('/health');
       const data = await res.json();
-      if (data.spotify) {
+      if (data.deezer) {
         dot.className     = 'status-dot ok';
-        label.textContent = 'Online — Spotify token ready';
+        label.textContent = 'Online — Deezer API ready';
       } else {
         dot.className     = 'status-dot err';
-        label.textContent = 'Spotify token unavailable';
+        label.textContent = 'Deezer API unavailable';
       }
     } catch {
       dot.className     = 'status-dot err';

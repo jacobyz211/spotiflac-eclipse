@@ -6,7 +6,6 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 const DZ   = 'https://api.deezer.com';
 
-// Your Claudochrome Render URL + a token generated from its website
 const CLAUDO_URL   = (process.env.CLAUDOCHROME_URL   || '').replace(/\/$/, '');
 const CLAUDO_TOKEN = (process.env.CLAUDOCHROME_TOKEN  || '');
 
@@ -27,10 +26,12 @@ function claudoBase() {
   return `${CLAUDO_URL}/u/${CLAUDO_TOKEN}`;
 }
 
+// Cache: deezerTrackId → { title, artist }           — persistent across requests
+const trackMetaCache = new Map();
 // Cache: deezerTrackId → { tidalId, expiresAt }
-const tidalIdCache  = new Map();
+const tidalIdCache   = new Map();
 // Cache: deezerTrackId → { url, format, quality, expiresAt }
-const streamCache   = new Map();
+const streamCache    = new Map();
 
 async function getTidalId(dzId, title, artist) {
   const cached = tidalIdCache.get(dzId);
@@ -45,9 +46,8 @@ async function getTidalId(dzId, title, artist) {
   const tracks = res.data?.tracks || [];
   if (!tracks.length) throw new Error(`Claudochrome: no results for "${q}"`);
 
-  // Pick first result — Claudochrome already ranks by relevance
   const tidalId = tracks[0].id;
-  tidalIdCache.set(dzId, { tidalId, expiresAt: Date.now() + 60 * 60 * 1000 }); // cache 1 hr
+  tidalIdCache.set(dzId, { tidalId, expiresAt: Date.now() + 60 * 60 * 1000 });
   console.log(`[tidal-match] "${title}" → TIDAL id ${tidalId}`);
   return tidalId;
 }
@@ -66,14 +66,67 @@ async function resolveStream(dzId, title, artist) {
     url:       data.url,
     format:    data.format   || 'flac',
     quality:   data.quality  || 'lossless',
-    expiresAt: data.expiresAt || Date.now() + 5 * 60 * 1000, // stream URLs expire ~5 min
+    expiresAt: data.expiresAt || Date.now() + 5 * 60 * 1000,
   };
   streamCache.set(dzId, result);
   return result;
 }
 
+// ─── Concurrency limiter ──────────────────────────────────────
+function pLimit(concurrency) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= concurrency || !queue.length) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() => { active--; next(); });
+  };
+  return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+}
+
+// ─── Enrich detail-endpoint tracks with pre-resolved stream URLs ──
+// Uses cache when available (instant). For uncached tracks, resolves
+// up to `concurrency` at a time so Eclipse gets streamURL stored
+// alongside the track in playlists/library — preventing addon loss.
+async function enrichTracksWithStreams(tracks, concurrency = 3) {
+  const limit = pLimit(concurrency);
+  return Promise.all(tracks.map(track =>
+    limit(async () => {
+      const dzId = track.id.replace(/^dz_/, '');
+      try {
+        // Instant path: already cached
+        const cached = streamCache.get(dzId);
+        if (cached && cached.expiresAt > Date.now()) {
+          return { ...track, streamURL: cached.url };
+        }
+        // Need meta to resolve — only proceed if we have it cached
+        const meta = trackMetaCache.get(dzId);
+        if (!meta) return track; // no meta yet, skip quietly
+
+        // Race against 4s so detail endpoints don't time out
+        const result = await Promise.race([
+          resolveStream(dzId, meta.title, meta.artist),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+        ]);
+        return { ...track, streamURL: result.url };
+      } catch {
+        return track; // graceful fallback — Eclipse will call /stream/:id
+      }
+    })
+  ));
+}
+
 // ─── Format helpers ───────────────────────────────────────────
 function fmtTrack(t, albumName, albumCover) {
+  // Populate trackMetaCache so /stream/:id never needs to call Deezer
+  const dzId = String(t.id);
+  if (!trackMetaCache.has(dzId)) {
+    trackMetaCache.set(dzId, {
+      title:  t.title,
+      artist: t.artist?.name || '',
+    });
+  }
   return {
     id:         `dz_${t.id}`,
     title:      t.title,
@@ -85,14 +138,36 @@ function fmtTrack(t, albumName, albumCover) {
     format:     'flac',
   };
 }
+
 function fmtAlbum(a) {
-  return { id:`dz_${a.id}`, title:a.title, artist:a.artist?.name||'', artworkURL:a.cover_xl||a.cover_big||undefined, trackCount:a.nb_tracks, year:a.release_date?.slice(0,4) };
+  return {
+    id:         `dz_${a.id}`,
+    title:      a.title,
+    artist:     a.artist?.name || '',
+    artworkURL: a.cover_xl || a.cover_big || undefined,
+    trackCount: a.nb_tracks,
+    year:       a.release_date?.slice(0, 4),
+  };
 }
+
 function fmtArtist(a) {
-  return { id:`dz_${a.id}`, name:a.name, artworkURL:a.picture_xl||a.picture_big||undefined, genres:[] };
+  return {
+    id:         `dz_${a.id}`,
+    name:       a.name,
+    artworkURL: a.picture_xl || a.picture_big || undefined,
+    genres:     [],
+  };
 }
+
 function fmtPlaylist(p) {
-  return { id:`dz_${p.id}`, title:p.title, creator:p.user?.name||p.creator?.name||'', artworkURL:p.picture_xl||p.picture_big||undefined, trackCount:p.nb_tracks, description:p.description||'' };
+  return {
+    id:          `dz_${p.id}`,
+    title:       p.title,
+    creator:     p.user?.name || p.creator?.name || '',
+    artworkURL:  p.picture_xl || p.picture_big || undefined,
+    trackCount:  p.nb_tracks,
+    description: p.description || '',
+  };
 }
 
 // ─── Website ──────────────────────────────────────────────────
@@ -192,7 +267,7 @@ app.get('/', (req, res) => res.type('html').send(HTML));
 app.get('/manifest.json', (req, res) => res.json({
   id:          'com.spotiflac.eclipse',
   name:        'SpotiFLAC',
-  version:     '4.0.0',
+  version:     '5.0.0',
   description: 'Deezer search + TIDAL FLAC via Claudochrome',
   resources:   ['search', 'stream', 'catalog'],
   types:       ['track', 'album', 'artist', 'playlist'],
@@ -200,19 +275,19 @@ app.get('/manifest.json', (req, res) => res.json({
 
 app.get('/search', async (req, res) => {
   const q = (req.query.q || '').trim();
-  if (!q) return res.json({ tracks:[], albums:[], artists:[], playlists:[] });
+  if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
   try {
     const [tr, al, ar, pl] = await Promise.allSettled([
-      deezerGet('/search',          { q, limit:20 }),
-      deezerGet('/search/album',    { q, limit:10 }),
-      deezerGet('/search/artist',   { q, limit:10 }),
-      deezerGet('/search/playlist', { q, limit:10 }),
+      deezerGet('/search',          { q, limit: 20 }),
+      deezerGet('/search/album',    { q, limit: 10 }),
+      deezerGet('/search/artist',   { q, limit: 10 }),
+      deezerGet('/search/playlist', { q, limit: 10 }),
     ]);
     res.json({
-      tracks:    tr.status==='fulfilled' ? (tr.value.data||[]).map(t=>fmtTrack(t)) : [],
-      albums:    al.status==='fulfilled' ? (al.value.data||[]).map(fmtAlbum)       : [],
-      artists:   ar.status==='fulfilled' ? (ar.value.data||[]).map(fmtArtist)      : [],
-      playlists: pl.status==='fulfilled' ? (pl.value.data||[]).map(fmtPlaylist)    : [],
+      tracks:    tr.status === 'fulfilled' ? (tr.value.data || []).map(t => fmtTrack(t)) : [],
+      albums:    al.status === 'fulfilled' ? (al.value.data || []).map(fmtAlbum)         : [],
+      artists:   ar.status === 'fulfilled' ? (ar.value.data || []).map(fmtArtist)        : [],
+      playlists: pl.status === 'fulfilled' ? (pl.value.data || []).map(fmtPlaylist)      : [],
     });
   } catch (err) {
     console.error('[search]', err.message);
@@ -220,12 +295,26 @@ app.get('/search', async (req, res) => {
   }
 });
 
+// ─── Stream resolution ────────────────────────────────────────
+// FIX: uses trackMetaCache first — eliminates the extra Deezer API
+// call that was the #1 cause of timeout-induced playlist source loss.
 app.get('/stream/:id', async (req, res) => {
   const dzId = req.params.id.replace(/^dz_/, '');
   try {
-    // Get title + artist from Deezer so we can search Claudochrome
-    const track  = await deezerGet(`/track/${dzId}`);
-    const result = await resolveStream(dzId, track.title, track.artist?.name || '');
+    let title, artist;
+
+    const metaCached = trackMetaCache.get(dzId);
+    if (metaCached) {
+      ({ title, artist } = metaCached);
+    } else {
+      // Cold fallback: track was never seen in a search — fetch from Deezer
+      const track = await deezerGet(`/track/${dzId}`);
+      title  = track.title;
+      artist = track.artist?.name || '';
+      trackMetaCache.set(dzId, { title, artist });
+    }
+
+    const result = await resolveStream(dzId, title, artist);
     res.json(result);
   } catch (err) {
     console.error('[stream]', err.message);
@@ -233,62 +322,107 @@ app.get('/stream/:id', async (req, res) => {
   }
 });
 
+// ─── Album details ────────────────────────────────────────────
+// FIX: enrichTracksWithStreams attaches streamURL to tracks so Eclipse
+// stores the addon + stream reference when users save album tracks to
+// playlists, preventing the "blank / no addon logo" bug on restart.
 app.get('/album/:id', async (req, res) => {
   const rawId = req.params.id.replace(/^dz_/, '');
   try {
-    const album = await deezerGet(`/album/${rawId}`);
-    const cover = album.cover_xl || album.cover_big;
+    const album     = await deezerGet(`/album/${rawId}`);
+    const cover     = album.cover_xl || album.cover_big;
+    const rawTracks = (album.tracks?.data || []).map(t => fmtTrack(t, album.title, cover));
+    const tracks    = await enrichTracksWithStreams(rawTracks);
     res.json({
-      id:`dz_${album.id}`, title:album.title, artist:album.artist?.name||'',
-      artworkURL:cover, year:album.release_date?.slice(0,4),
-      description:album.label||'', trackCount:album.nb_tracks,
-      tracks:(album.tracks?.data||[]).map(t=>fmtTrack(t,album.title,cover)),
+      id:          `dz_${album.id}`,
+      title:       album.title,
+      artist:      album.artist?.name || '',
+      artworkURL:  cover,
+      year:        album.release_date?.slice(0, 4),
+      description: album.label || '',
+      trackCount:  album.nb_tracks,
+      tracks,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('[album]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// ─── Artist details ───────────────────────────────────────────
 app.get('/artist/:id', async (req, res) => {
   const rawId = req.params.id.replace(/^dz_/, '');
   try {
     const [artist, top, albums] = await Promise.all([
       deezerGet(`/artist/${rawId}`),
-      deezerGet(`/artist/${rawId}/top`,    { limit:20 }),
-      deezerGet(`/artist/${rawId}/albums`, { limit:20 }),
+      deezerGet(`/artist/${rawId}/top`,    { limit: 20 }),
+      deezerGet(`/artist/${rawId}/albums`, { limit: 20 }),
     ]);
+    const rawTopTracks = (top.data || []).map(t => fmtTrack(t));
+    const topTracks    = await enrichTracksWithStreams(rawTopTracks);
     res.json({
-      id:`dz_${artist.id}`, name:artist.name,
-      artworkURL:artist.picture_xl||artist.picture_big,
-      genres:[], bio:'',
-      topTracks:(top.data||[]).map(t=>fmtTrack(t)),
-      albums:(albums.data||[]).map(fmtAlbum),
+      id:         `dz_${artist.id}`,
+      name:       artist.name,
+      artworkURL: artist.picture_xl || artist.picture_big,
+      genres:     [],
+      bio:        '',
+      topTracks,
+      albums:     (albums.data || []).map(fmtAlbum),
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('[artist]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// ─── Playlist details ─────────────────────────────────────────
 app.get('/playlist/:id', async (req, res) => {
   const rawId = req.params.id.replace(/^dz_/, '');
   try {
-    const pl = await deezerGet(`/playlist/${rawId}`);
+    const pl        = await deezerGet(`/playlist/${rawId}`);
+    const rawTracks = (pl.tracks?.data || []).map(t => fmtTrack(t));
+    const tracks    = await enrichTracksWithStreams(rawTracks);
     res.json({
-      id:`dz_${pl.id}`, title:pl.title, description:pl.description||'',
-      artworkURL:pl.picture_xl||pl.picture_big,
-      creator:pl.creator?.name||'',
-      tracks:(pl.tracks?.data||[]).map(t=>fmtTrack(t)),
+      id:          `dz_${pl.id}`,
+      title:       pl.title,
+      description: pl.description || '',
+      artworkURL:  pl.picture_xl || pl.picture_big,
+      creator:     pl.creator?.name || '',
+      tracks,
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error('[playlist]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// ─── Health check ─────────────────────────────────────────────
 app.get('/health', async (req, res) => {
   let claudoOk = false, error = null;
   try {
     if (!CLAUDO_URL || !CLAUDO_TOKEN) throw new Error('CLAUDOCHROME_URL or CLAUDOCHROME_TOKEN not set');
-    await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params:{ q:'test', limit:1 }, timeout:6000 });
+    await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
     claudoOk = true;
   } catch (e) { error = e.message; }
-  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '4.0.0' });
+  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.0.0' });
 });
 
+// ─── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`SpotiFLAC v4 → http://localhost:${PORT}`);
-  console.log(`Claudochrome: ${CLAUDO_URL || '⚠ CLAUDOCHROME_URL not set'}`);
+  console.log(`SpotiFLAC v5 → http://localhost:${PORT}`);
+  console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
+
+  // Keep Render's free tier warm so Eclipse stream requests never hit a
+  // cold start (cold starts cause timeout → Eclipse drops the addon source).
+  if (process.env.RENDER_EXTERNAL_URL) {
+    const selfUrl = process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
+    setInterval(async () => {
+      try {
+        await axios.get(`${selfUrl}/health`, { timeout: 5000 });
+        console.log('[keepalive] ping ok');
+      } catch (e) {
+        console.warn('[keepalive] ping failed:', e.message);
+      }
+    }, 4 * 60 * 1000); // every 4 minutes
+  }
 });

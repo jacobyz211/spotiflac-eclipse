@@ -257,27 +257,31 @@ const HTML = `<!DOCTYPE html>
 // ─── Routes ───────────────────────────────────────────────────
 app.get('/', (req, res) => res.type('html').send(HTML));
 
-app.get('/manifest.json', (req, res) => res.json({
-  id:          'com.spotiflac.eclipse',
-  name:        'SpotiFLAC',
-  version:     '5.2.0',
-  description: 'Deezer search + TIDAL FLAC via Claudochrome',
-  // FIX: resources as array of objects instead of strings.
-  // Android Eclipse uses Gson which strictly expects objects here,
-  // while iOS was lenient enough to accept plain strings.
-  // Android Eclipse (Gson) requires objects with a 'name' key — plain strings cause a parse error
-  resources: [
-    { name: 'search'  },
-    { name: 'stream'  },
-    { name: 'catalog' },
-  ],
-  types: [
-    { name: 'track'    },
-    { name: 'album'    },
-    { name: 'artist'   },
-    { name: 'playlist' },
-  ],
-}));
+app.get('/manifest.json', (req, res) => {
+  const ua        = (req.headers['user-agent'] || '').toLowerCase();
+  const isAndroid = /android/.test(ua);
+
+  // iOS Swift Codable expects plain strings: ["search", "stream"]
+  // Android Gson expects objects:           [{ name: "search" }, ...]
+  // Detect platform from User-Agent and serve the correct format.
+  const resources = isAndroid
+    ? [{ name: 'search' }, { name: 'stream' }, { name: 'catalog' }]
+    : ['search', 'stream', 'catalog'];
+
+  const types = isAndroid
+    ? [{ name: 'track' }, { name: 'album' }, { name: 'artist' }, { name: 'playlist' }]
+    : ['track', 'album', 'artist', 'playlist'];
+
+  res.json({
+    id:          'com.spotiflac.eclipse',
+    name:        'SpotiFLAC',
+    version:     '5.3.0',
+    description: 'Deezer search + TIDAL FLAC via Claudochrome',
+    resources,
+    types,
+  });
+});
+
 
 app.get('/search', async (req, res) => {
   const q = (req.query.q || '').trim();
@@ -404,12 +408,12 @@ app.get('/health', async (req, res) => {
     await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
     claudoOk = true;
   } catch (e) { error = e.message; }
-  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.2.0' });
+  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.3.0' });
 });
 
 // ─── Start ────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`SpotiFLAC v5.2.0 → http://localhost:${PORT}`);
+  console.log(`SpotiFLAC v5.3.0 → http://localhost:${PORT}`);
   console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
 
   if (process.env.RENDER_EXTERNAL_URL) {

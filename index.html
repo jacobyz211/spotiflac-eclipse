@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpotiFLAC — Eclipse Addon</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0a0a0b;
+      --surface:    #111113;
+      --surface-2:  #1a1a1d;
+      --border:     rgba(255,255,255,0.08);
+      --text:       #e8e8ea;
+      --muted:      #888890;
+      --faint:      #444448;
+      --green:      #1ed760;
+      --green-dim:  rgba(30,215,96,0.12);
+      --green-glow: rgba(30,215,96,0.18);
+      --radius:     12px;
+      --radius-sm:  8px;
+      --transition: 180ms cubic-bezier(0.16,1,0.3,1);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100dvh;
+      -webkit-font-smoothing: antialiased;
+      line-height: 1.6;
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 clamp(1.5rem, 5vw, 4rem);
+      height: 64px;
+      background: rgba(10,10,11,0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-logo { display: flex; align-items: center; gap: 10px; font-size: 1rem; font-weight: 600; color: var(--text); text-decoration: none; }
+    .logo-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.6;transform:scale(.85)} }
+    .badge { font-size: 0.7rem; font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--green-dim); color: var(--green); border: 1px solid rgba(30,215,96,0.25); letter-spacing: 0.04em; text-transform: uppercase; }
+
+    /* ── HERO ── */
+    .hero {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center;
+      padding: clamp(5rem, 12vw, 9rem) clamp(1.5rem, 5vw, 4rem) clamp(4rem, 8vw, 7rem);
+      gap: 2rem;
+    }
+    .hero-eyebrow { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--green); }
+    .hero-title { font-size: clamp(2.5rem, 6vw, 4.5rem); font-weight: 700; line-height: 1.1; letter-spacing: -0.03em; }
+    .hero-title span { color: var(--green); }
+    .hero-sub { font-size: clamp(1rem, 2vw, 1.2rem); color: var(--muted); max-width: 520px; line-height: 1.7; }
+
+    /* ── INSTALL CARD ── */
+    .install-section {
+      padding: 0 clamp(1.5rem, 5vw, 4rem) clamp(4rem, 8vw, 6rem);
+      display: flex; flex-direction: column; align-items: center; gap: 1.5rem;
+    }
+    .install-card {
+      width: 100%; max-width: 640px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .install-card-header {
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 0.75rem;
+    }
+    .install-card-header svg { color: var(--green); flex-shrink: 0; }
+    .install-card-header span { font-size: 0.875rem; font-weight: 600; color: var(--text); }
+    .url-row {
+      display: flex; align-items: center;
+      padding: 1rem 1.25rem; gap: 0.75rem;
+    }
+    .url-display {
+      flex: 1; font-family: 'SFMono-Regular', 'Menlo', monospace;
+      font-size: 0.85rem; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .url-display em { color: var(--green); font-style: normal; }
+    .copy-btn {
+      flex-shrink: 0;
+      display: flex; align-items: center; gap: 6px;
+      padding: 8px 16px; border-radius: var(--radius-sm);
+      background: var(--green); color: #000;
+      font-size: 0.8rem; font-weight: 700; cursor: pointer; border: none;
+      transition: transform var(--transition), background var(--transition);
+    }
+    .copy-btn:hover { background: #24f067; transform: translateY(-1px); }
+    .copy-btn:active { transform: translateY(0); }
+    .copy-btn.copied { background: var(--surface-2); color: var(--green); border: 1px solid rgba(30,215,96,0.3); }
+
+    .install-steps {
+      width: 100%; max-width: 640px;
+      display: grid; gap: 0.75rem;
+    }
+    .step {
+      display: flex; align-items: flex-start; gap: 1rem;
+      padding: 1rem 1.25rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+    .step-num {
+      flex-shrink: 0;
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--green-dim); border: 1px solid rgba(30,215,96,0.25);
+      color: var(--green); font-size: 0.75rem; font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .step-text { font-size: 0.875rem; color: var(--muted); line-height: 1.5; }
+    .step-text strong { color: var(--text); }
+
+    /* ── FEATURES ── */
+    .features {
+      padding: clamp(3rem, 6vw, 5rem) clamp(1.5rem, 5vw, 4rem);
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(min(280px,100%), 1fr));
+      gap: 1rem; max-width: 960px; margin: 0 auto;
+    }
+    .feature-card {
+      padding: 1.5rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius);
+      transition: border-color var(--transition), transform var(--transition);
+    }
+    .feature-card:hover { border-color: rgba(30,215,96,0.25); transform: translateY(-2px); }
+    .feature-icon {
+      width: 40px; height: 40px; border-radius: var(--radius-sm);
+      background: var(--green-dim); color: var(--green);
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 1rem;
+    }
+    .feature-title { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.4rem; }
+    .feature-desc  { font-size: 0.85rem; color: var(--muted); line-height: 1.6; }
+
+    /* ── ENV INFO ── */
+    .env-section {
+      max-width: 640px; margin: 0 auto;
+      padding: 0 clamp(1.5rem, 5vw, 4rem) clamp(4rem, 8vw, 6rem);
+    }
+    .env-title { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
+    .env-table {
+      width: 100%; border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    .env-table th, .env-table td {
+      padding: 0.75rem 1rem; text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .env-table th { color: var(--muted); font-weight: 500; }
+    .env-table td:first-child { font-family: monospace; color: var(--green); }
+    .env-table tr:last-child td { border-bottom: none; }
+
+    /* ── FOOTER ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem clamp(1.5rem, 5vw, 4rem);
+      text-align: center; font-size: 0.8rem; color: var(--faint);
+    }
+
+    /* ── STATUS PILL ── */
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 12px; border-radius: 99px;
+      font-size: 0.75rem; font-weight: 600;
+      border: 1px solid var(--border); background: var(--surface);
+      cursor: pointer;
+    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+    .status-dot.ok  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .status-dot.err { background: #ff4d6d; box-shadow: 0 0 6px #ff4d6d; }
+    .status-label { color: var(--muted); }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a class="nav-logo" href="/">
+    <div class="logo-dot"></div>
+    SpotiFLAC
+  </a>
+  <span class="badge">Eclipse Addon</span>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <p class="hero-eyebrow">Eclipse Music · Community Addon</p>
+  <h1 class="hero-title">Spotify search.<br/><span>FLAC quality.</span></h1>
+  <p class="hero-sub">Search the entire Spotify catalog inside Eclipse. Every track resolves to a lossless FLAC stream via TidalFi — no account required.</p>
+  <div id="statusPill" class="status-pill" onclick="checkHealth()" title="Click to refresh">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-label" id="statusLabel">Checking…</span>
+  </div>
+</section>
+
+<!-- INSTALL CARD -->
+<section class="install-section">
+  <div class="install-card">
+    <div class="install-card-header">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+      <span>Your addon URL</span>
+    </div>
+    <div class="url-row">
+      <div class="url-display" id="addonUrl"><em>loading…</em></div>
+      <button class="copy-btn" id="copyBtn" onclick="copyUrl()">
+        <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        Copy
+      </button>
+    </div>
+  </div>
+
+  <div class="install-steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-text">Open <strong>Eclipse Music</strong> on your iPhone or iPad.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-text">Go to <strong>Settings → Connections → Add Connection → Addon</strong>.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-text">Paste the URL above and tap <strong>Install</strong>. SpotiFLAC will appear in your search dropdown.</div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-text">Optional: Set SpotiFLAC as your <strong>Default Playback</strong> source in <strong>Settings → Addon Management</strong> so Home, Radio, and DJ all stream FLAC automatically.</div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="features">
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    </div>
+    <div class="feature-title">Full Spotify catalog</div>
+    <div class="feature-desc">Search tracks, albums, artists, and playlists — everything Spotify indexes, including new releases.</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+    </div>
+    <div class="feature-title">FLAC / Lossless streams</div>
+    <div class="feature-desc">Streams are resolved via TidalFi (the same backend SpotiFLAC uses) using the track's ISRC code.</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    </div>
+    <div class="feature-title">No account needed</div>
+    <div class="feature-desc">Uses an anonymous Spotify token for search. No login, no credentials, no rate-limit keys to manage.</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    </div>
+    <div class="feature-title">ISRC enrichment</div>
+    <div class="feature-desc">Every track carries its ISRC code. Eclipse uses it to pull synced lyrics, artwork, and genre tags from Apple Music automatically.</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    </div>
+    <div class="feature-title">Full catalog browsing</div>
+    <div class="feature-desc">Tap into any album, artist, or playlist returned by search — Eclipse loads full track lists directly from this addon.</div>
+  </div>
+  <div class="feature-card">
+    <div class="feature-icon">
+      <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </div>
+    <div class="feature-title">Offline downloads</div>
+    <div class="feature-desc">Tracks with direct stream URLs can be saved for offline listening inside Eclipse. No server needed for playback once downloaded.</div>
+  </div>
+</section>
+
+<!-- ENV VARS -->
+<section class="env-section">
+  <div class="env-title">Environment variables (Render / Railway / Fly.io)</div>
+  <table class="env-table">
+    <thead>
+      <tr><th>Key</th><th>Default</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>PORT</td>
+        <td>3000</td>
+        <td>Set automatically by hosting platforms</td>
+      </tr>
+      <tr>
+        <td>HIFI_URL</td>
+        <td>https://doubleld.top</td>
+        <td>TidalFi stream backend. Swap to your own Tidal/Qobuz proxy if needed</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer>
+  SpotiFLAC Eclipse Addon — Spotify search · FLAC via TidalFi · No account required
+</footer>
+
+<script>
+  const origin = window.location.origin;
+
+  // Set addon URL
+  document.getElementById('addonUrl').innerHTML =
+    `<em>${origin}</em>/manifest.json`;
+
+  function copyUrl() {
+    const url = `${origin}/manifest.json`;
+    navigator.clipboard.writeText(url).then(() => {
+      const btn = document.getElementById('copyBtn');
+      btn.textContent = '✓ Copied';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.innerHTML = `<svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy`;
+        btn.classList.remove('copied');
+      }, 2000);
+    });
+  }
+
+  async function checkHealth() {
+    const dot   = document.getElementById('statusDot');
+    const label = document.getElementById('statusLabel');
+    dot.className   = 'status-dot';
+    label.textContent = 'Checking…';
+    try {
+      const res  = await fetch('/health');
+      const data = await res.json();
+      if (data.spotify) {
+        dot.className     = 'status-dot ok';
+        label.textContent = 'Online — Spotify token ready';
+      } else {
+        dot.className     = 'status-dot err';
+        label.textContent = 'Spotify token unavailable';
+      }
+    } catch {
+      dot.className     = 'status-dot err';
+      label.textContent = 'Addon offline';
+    }
+  }
+
+  checkHealth();
+</script>
+</body>
+</html>

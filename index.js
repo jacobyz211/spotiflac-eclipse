@@ -11,6 +11,7 @@ const MONOCHROME_URL = (process.env.MONOCHROME_URL || process.env.CLAUDOCHROME_U
 const APP_BASE_URL = (process.env.APP_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'change-me-in-production';
 
+app.set('trust proxy', true);
 app.use(cors());
 app.use(express.json());
 
@@ -26,7 +27,10 @@ function monochromeBase() {
 }
 
 function baseUrl(req) {
-  return APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
+  if (APP_BASE_URL) return APP_BASE_URL;
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').toString().split(',')[0].trim();
+  const host = (req.headers['x-forwarded-host'] || req.get('host') || '').toString().split(',')[0].trim();
+  return `${proto}://${host}`;
 }
 
 const trackMetaCache = new Map();
@@ -369,8 +373,15 @@ const HTML = `<!DOCTYPE html>
 app.get('/', (req, res) => res.type('html').send(HTML));
 
 app.get('/generate-url', (req, res) => {
-  const token = makeUserToken(req);
-  res.json({ manifestUrl: `${baseUrl(req)}/u/${token}/manifest.json` });
+  try {
+    const token = makeUserToken(req);
+    const root = baseUrl(req);
+    if (!/^https?:\/\//.test(root)) throw new Error('Could not determine public base URL');
+    res.json({ manifestUrl: `${root}/u/${token}/manifest.json` });
+  } catch (e) {
+    console.error('[generate-url]', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/manifest.json', (req, res) => {

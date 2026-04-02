@@ -318,7 +318,7 @@ app.get('/manifest.json', (req, res) => {
     name:        'ClaudiFLAC',
     version:     '5.5.0',
     description: 'Deezer search + TIDAL FLAC via Claudochrome',
-    icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRCxo4Ue-nYzG-_EKQMszNpVPk-Z9vpIIKvLncvWeLzhQ&s=10',
+    icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTVEu2Vv2QFKNF9ogOI2kI36dpX3whid9Zr4lvx7bsZAA&s=10',
     resources,
     types,
   });

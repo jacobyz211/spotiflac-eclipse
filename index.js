@@ -315,10 +315,10 @@ app.get('/manifest.json', (req, res) => {
 
   res.json({
     id:          'com.spotiflac.eclipse',
-    name:        'SpotiFLAC',
+    name:        'ClaudiFLAC',
     version:     '5.5.0',
     description: 'Deezer search + TIDAL FLAC via Claudochrome',
-    icon:        'https://staging.svgrepo.com/show/28630/deezer-logo.svg',
+    icon:        'https://e7.pngegg.com/pngimages/421/958/png-clipart-deezer-logo-black-privilege-deezer-angle-text.png',
     resources,
     types,
   });

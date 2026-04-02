@@ -317,7 +317,6 @@ app.get('/manifest.json', (req, res) => {
     id:          'com.deezer.eclipse',
     name:        'Deezer',
     version:     '5.5.0',
-    icon:        'https://staging.svgrepo.com/show/28630/deezer-logo.svg',
     description: 'Deezer search + TIDAL FLAC via Claudochrome',
     resources,
     types,

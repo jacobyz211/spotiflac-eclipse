@@ -1,0 +1,470 @@
+const express = require('express');
+const cors    = require('cors');
+const axios   = require('axios');
+
+const app  = express();
+const PORT = process.env.PORT || 3000;
+const DZ   = 'https://api.deezer.com';
+
+const CLAUDO_URL   = (process.env.CLAUDOCHROME_URL   || '').replace(/\/$/, '');
+const CLAUDO_TOKEN = (process.env.CLAUDOCHROME_TOKEN  || '');
+
+app.use(cors());
+app.use(express.json());
+
+// ─── Deezer helper ────────────────────────────────────────────
+async function deezerGet(endpoint, params = {}) {
+  const res = await axios.get(`${DZ}${endpoint}`, { params, timeout: 10000 });
+  if (res.data?.error) throw new Error(`Deezer: ${res.data.error.message}`);
+  return res.data;
+}
+
+// ─── Claudochrome helpers ─────────────────────────────────────
+function claudoBase() {
+  if (!CLAUDO_URL)   throw new Error('CLAUDOCHROME_URL env var not set.');
+  if (!CLAUDO_TOKEN) throw new Error('CLAUDOCHROME_TOKEN env var not set.');
+  return `${CLAUDO_URL}/u/${CLAUDO_TOKEN}`;
+}
+
+// Cache: deezerTrackId → { title, artist }
+const trackMetaCache = new Map();
+// Cache: deezerTrackId → { tidalId, expiresAt }
+const tidalIdCache   = new Map();
+// Cache: deezerTrackId → { url, format, quality, expiresAt }
+const streamCache    = new Map();
+
+// ─── Match scoring ────────────────────────────────────────────
+function normStr(s) {
+  return String(s || '').toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function strScore(a, b) {
+  a = normStr(a); b = normStr(b);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.85;
+  const sa = new Set(a.split(' ')), sb = new Set(b.split(' '));
+  const inter = [...sa].filter(w => w.length > 1 && sb.has(w)).length;
+  return inter / Math.max(new Set([...sa, ...sb]).size, 1);
+}
+
+// Fix 1: don't duplicate artist words already present in the title.
+// "Hi Ren" + "Ren"  → query "Hi Ren"       (not "Hi Ren Ren")
+// "Hello"  + "Adele" → query "Hello Adele"  (normal)
+function buildSearchQuery(title, artist) {
+  const titleNorm  = normStr(title);
+  const artistWords = normStr(artist).split(' ').filter(w => w.length > 1);
+  const allInTitle  = artistWords.length > 0 && artistWords.every(w => titleNorm.includes(w));
+  return allInTitle ? title : `${title} ${artist}`.trim();
+}
+
+// Fix 2: require a minimum title score so a same-artist/wrong-title
+// result (score driven purely by artist) can never win.
+function bestTidalMatch(tracks, title, artist) {
+  if (!tracks.length) return null;
+  let best = null, bestScore = -1;
+  for (const t of tracks) {
+    const titleScore = strScore(t.title, title);
+    if (titleScore < 0.15) continue;                         // ← reject if title doesn't match at all
+    const score = titleScore * 0.4 + strScore(t.artist, artist) * 0.6;
+    if (score > bestScore) { bestScore = score; best = t; }
+  }
+  if (best) console.log(`[tidal-match] best ${bestScore.toFixed(3)} → "${best.title}" by "${best.artist}"`);
+  return bestScore >= 0.25 ? best : null;
+}
+
+async function getTidalId(dzId, title, artist) {
+  const cached = tidalIdCache.get(dzId);
+  if (cached && cached.expiresAt > Date.now()) return cached.tidalId;
+
+  const q   = buildSearchQuery(title, artist);              // ← smart query, no duplicates
+  console.log(`[tidal-search] query: "${q}"`);
+  const res = await axios.get(`${claudoBase()}/search`, {
+    params:  { q, limit: 10 },
+    timeout: 12000,
+  });
+
+  const tracks = res.data?.tracks || [];
+  if (!tracks.length) throw new Error(`Claudochrome: no results for "${q}"`);
+
+  const match = bestTidalMatch(tracks, title, artist);
+  if (!match) throw new Error(`Claudochrome: no confident match for "${title}" by "${artist}"`);
+
+  const tidalId = match.id;
+  tidalIdCache.set(dzId, { tidalId, expiresAt: Date.now() + 60 * 60 * 1000 });
+  console.log(`[tidal-match] "${title}" by "${artist}" → TIDAL id ${tidalId}`);
+  return tidalId;
+}
+
+async function resolveStream(dzId, title, artist) {
+  const cached = streamCache.get(dzId);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  const tidalId  = await getTidalId(dzId, title, artist);
+  const res      = await axios.get(`${claudoBase()}/stream/${tidalId}`, { timeout: 12000 });
+  const data     = res.data;
+
+  if (!data?.url) throw new Error(`Claudochrome: no stream URL for TIDAL id ${tidalId}`);
+
+  const result = {
+    url:       data.url,
+    format:    data.format   || 'flac',
+    quality:   data.quality  || 'lossless',
+    expiresAt: data.expiresAt || Date.now() + 5 * 60 * 1000,
+  };
+  streamCache.set(dzId, result);
+  return result;
+}
+
+// ─── Concurrency limiter ──────────────────────────────────────
+function pLimit(concurrency) {
+  let active = 0;
+  const queue = [];
+  const next = () => {
+    if (active >= concurrency || !queue.length) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() => { active--; next(); });
+  };
+  return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+}
+
+// ─── Enrich detail-endpoint tracks with pre-resolved stream URLs ──
+async function enrichTracksWithStreams(tracks, concurrency = 3) {
+  const limit = pLimit(concurrency);
+  return Promise.all(tracks.map(track =>
+    limit(async () => {
+      const dzId = track.id.replace(/^dz_/, '');
+      try {
+        const cached = streamCache.get(dzId);
+        if (cached && cached.expiresAt > Date.now()) {
+          return { ...track, streamURL: cached.url };
+        }
+        const meta = trackMetaCache.get(dzId);
+        if (!meta) return track;
+
+        const result = await Promise.race([
+          resolveStream(dzId, meta.title, meta.artist),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+        ]);
+        return { ...track, streamURL: result.url };
+      } catch {
+        return track;
+      }
+    })
+  ));
+}
+
+// ─── Format helpers ───────────────────────────────────────────
+function fmtTrack(t, albumName, albumCover) {
+  const dzId = String(t.id);
+  if (!trackMetaCache.has(dzId)) {
+    trackMetaCache.set(dzId, {
+      title:  t.title,
+      artist: t.artist?.name || '',
+    });
+  }
+  return {
+    id:         `dz_${t.id}`,
+    title:      t.title,
+    artist:     t.artist?.name || '',
+    album:      t.album?.title || albumName || '',
+    duration:   t.duration,
+    artworkURL: t.album?.cover_xl || t.album?.cover_big || albumCover || undefined,
+    isrc:       t.isrc || undefined,
+    format:     'flac',
+  };
+}
+
+function fmtAlbum(a) {
+  return {
+    id:         `dz_${a.id}`,
+    title:      a.title,
+    artist:     a.artist?.name || '',
+    artworkURL: a.cover_xl || a.cover_big || undefined,
+    trackCount: a.nb_tracks,
+    year:       a.release_date?.slice(0, 4),
+  };
+}
+
+function fmtArtist(a) {
+  return {
+    id:         `dz_${a.id}`,
+    name:       a.name,
+    artworkURL: a.picture_xl || a.picture_big || undefined,
+    genres:     [],
+  };
+}
+
+function fmtPlaylist(p) {
+  return {
+    id:          `dz_${p.id}`,
+    title:       p.title,
+    creator:     p.user?.name || p.creator?.name || '',
+    artworkURL:  p.picture_xl || p.picture_big || undefined,
+    trackCount:  p.nb_tracks,
+    description: p.description || '',
+  };
+}
+
+// ─── Website ──────────────────────────────────────────────────
+const HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Deezer — Eclipse Addon</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#0a0a0b;--surface:#111113;--border:rgba(255,255,255,0.08);--text:#e8e8ea;--muted:#8a8a92;--green:#1ed760;--gd:rgba(30,215,96,0.12);--r:14px}
+    body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;-webkit-font-smoothing:antialiased}
+    nav{position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:64px;border-bottom:1px solid var(--border);background:rgba(10,10,11,0.85);backdrop-filter:blur(12px)}
+    .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px}
+    .dot{width:10px;height:10px;border-radius:999px;background:var(--green);box-shadow:0 0 10px var(--green)}
+    .badge{font-size:11px;font-weight:700;color:var(--green);border:1px solid rgba(30,215,96,0.25);background:var(--gd);border-radius:999px;padding:4px 10px;text-transform:uppercase;letter-spacing:.08em}
+    .hero{max-width:920px;margin:0 auto;padding:72px 24px 40px;text-align:center}
+    .ey{color:var(--green);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:14px}
+    h1{font-size:clamp(2.4rem,6vw,4.8rem);line-height:1.05;letter-spacing:-0.04em;margin-bottom:16px}
+    h1 span{color:var(--green)}
+    .sub{color:var(--muted);max-width:620px;margin:0 auto 20px;font-size:17px}
+    .status{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--surface);border-radius:999px;padding:8px 14px;font-size:13px;color:var(--muted);cursor:pointer}
+    .sdot{width:8px;height:8px;border-radius:999px;background:#666}
+    .sdot.ok{background:var(--green);box-shadow:0 0 8px var(--green)}
+    .sdot.bad{background:#ff5a6a;box-shadow:0 0 8px #ff5a6a}
+    .sec{max-width:680px;margin:0 auto;padding:0 24px 48px}
+    .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+    .ch{padding:16px 18px;border-bottom:1px solid var(--border);font-size:14px;font-weight:700}
+    .row{display:flex;gap:12px;align-items:center;padding:16px 18px;flex-wrap:wrap}
+    .url{flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .url em{color:var(--green);font-style:normal}
+    button{border:0;cursor:pointer;border-radius:10px;background:var(--green);color:#000;font-weight:800;padding:10px 16px}
+    .steps{display:grid;gap:10px;margin-top:16px}
+    .step{display:flex;gap:12px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+    .num{width:28px;height:28px;border-radius:999px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:var(--gd);color:var(--green);border:1px solid rgba(30,215,96,0.24);font-size:12px;font-weight:800}
+    .txt{color:var(--muted);font-size:14px}.txt strong{color:var(--text)}
+    footer{border-top:1px solid var(--border);color:var(--muted);text-align:center;font-size:13px;padding:22px}
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="brand"><div class="dot"></div>Deezer</div>
+    <div class="badge">Eclipse Addon</div>
+  </nav>
+  <section class="hero">
+    <div class="ey">Eclipse Music · Community Addon</div>
+    <h1>Deezer search.<br><span>TIDAL FLAC.</span></h1>
+    <p class="sub">Deezer catalog for search. Claudochrome for lossless TIDAL streams. No extra accounts needed.</p>
+    <div class="status" onclick="checkHealth()">
+      <div class="sdot" id="dot"></div>
+      <span id="stxt">Checking\u2026</span>
+    </div>
+  </section>
+  <section class="sec">
+    <div class="card">
+      <div class="ch">Addon URL</div>
+      <div class="row">
+        <div class="url" id="addonUrl"><em>loading\u2026</em></div>
+        <button onclick="copyUrl(this)">Copy</button>
+      </div>
+    </div>
+    <div class="steps">
+      <div class="step"><div class="num">1</div><div class="txt">Open <strong>Eclipse Music</strong>.</div></div>
+      <div class="step"><div class="num">2</div><div class="txt">Go to <strong>Settings \u2192 Connections \u2192 Add Connection \u2192 Addon</strong>.</div></div>
+      <div class="step"><div class="num">3</div><div class="txt">Paste the URL above and tap <strong>Install</strong>.</div></div>
+      <div class="step"><div class="num">4</div><div class="txt">Optional: set as <strong>Default Playback</strong> for TIDAL streams across Home, Radio, and DJ.</div></div>
+    </div>
+  </section>
+  <footer>Deezer \u00b7 Deezer + Claudochrome \u00b7 Eclipse Music Addon</footer>
+  <script>
+    document.getElementById('addonUrl').innerHTML='<em>'+location.origin+'<\/em>/manifest.json';
+    async function copyUrl(btn){
+      await navigator.clipboard.writeText(location.origin+'/manifest.json');
+      btn.textContent='Copied'; setTimeout(()=>btn.textContent='Copy',1500);
+    }
+    async function checkHealth(){
+      const dot=document.getElementById('dot'),txt=document.getElementById('stxt');
+      dot.className='sdot'; txt.textContent='Checking\u2026';
+      try{
+        const d=await(await fetch('/health')).json();
+        if(d.claudochrome){dot.className='sdot ok';txt.textContent='Online \u2014 Claudochrome ready';}
+        else{dot.className='sdot bad';txt.textContent=d.error||'Claudochrome unreachable';}
+      }catch{dot.className='sdot bad';txt.textContent='Addon offline';}
+    }
+    checkHealth();
+  <\/script>
+</body>
+</html>`;
+
+// ─── Routes ───────────────────────────────────────────────────
+app.get('/', (req, res) => res.type('html').send(HTML));
+
+app.get('/manifest.json', (req, res) => {
+  const ua    = (req.headers['user-agent'] || '').toLowerCase();
+  const isiOS = /cfnetwork|darwin|iphone|ipad|ipod/.test(ua);
+
+  const resources = isiOS
+    ? ['search', 'stream', 'catalog']
+    : [{ name: 'search' }, { name: 'stream' }, { name: 'catalog' }];
+
+  const types = isiOS
+    ? ['track', 'album', 'artist', 'playlist']
+    : [{ name: 'track' }, { name: 'album' }, { name: 'artist' }, { name: 'playlist' }];
+
+  res.json({
+    id:          'com.deezer.eclipse',
+    name:        'Deezer',
+    version:     '5.5.0',
+    description: 'Deezer search + TIDAL FLAC via Claudochrome',
+    resources,
+    types,
+  });
+});
+
+app.get('/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+  try {
+    const [tr, al, ar, pl] = await Promise.allSettled([
+      deezerGet('/search',          { q, limit: 20 }),
+      deezerGet('/search/album',    { q, limit: 10 }),
+      deezerGet('/search/artist',   { q, limit: 10 }),
+      deezerGet('/search/playlist', { q, limit: 10 }),
+    ]);
+    res.json({
+      tracks:    tr.status === 'fulfilled' ? (tr.value.data || []).map(t => fmtTrack(t)) : [],
+      albums:    al.status === 'fulfilled' ? (al.value.data || []).map(fmtAlbum)         : [],
+      artists:   ar.status === 'fulfilled' ? (ar.value.data || []).map(fmtArtist)        : [],
+      playlists: pl.status === 'fulfilled' ? (pl.value.data || []).map(fmtPlaylist)      : [],
+    });
+  } catch (err) {
+    console.error('[search]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Stream resolution ────────────────────────────────────────
+app.get('/stream/:id', async (req, res) => {
+  const dzId = req.params.id.replace(/^dz_/, '');
+  try {
+    let title, artist;
+
+    const metaCached = trackMetaCache.get(dzId);
+    if (metaCached) {
+      ({ title, artist } = metaCached);
+    } else {
+      const track = await deezerGet(`/track/${dzId}`);
+      title  = track.title;
+      artist = track.artist?.name || '';
+      trackMetaCache.set(dzId, { title, artist });
+    }
+
+    const result = await resolveStream(dzId, title, artist);
+    res.json(result);
+  } catch (err) {
+    console.error('[stream]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Album details ────────────────────────────────────────────
+app.get('/album/:id', async (req, res) => {
+  const rawId = req.params.id.replace(/^dz_/, '');
+  try {
+    const album     = await deezerGet(`/album/${rawId}`);
+    const cover     = album.cover_xl || album.cover_big;
+    const rawTracks = (album.tracks?.data || []).map(t => fmtTrack(t, album.title, cover));
+    const tracks    = await enrichTracksWithStreams(rawTracks);
+    res.json({
+      id:          `dz_${album.id}`,
+      title:       album.title,
+      artist:      album.artist?.name || '',
+      artworkURL:  cover,
+      year:        album.release_date?.slice(0, 4),
+      description: album.label || '',
+      trackCount:  album.nb_tracks,
+      tracks,
+    });
+  } catch (err) {
+    console.error('[album]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Artist details ───────────────────────────────────────────
+app.get('/artist/:id', async (req, res) => {
+  const rawId = req.params.id.replace(/^dz_/, '');
+  try {
+    const [artist, top, albums] = await Promise.all([
+      deezerGet(`/artist/${rawId}`),
+      deezerGet(`/artist/${rawId}/top`,    { limit: 20 }),
+      deezerGet(`/artist/${rawId}/albums`, { limit: 20 }),
+    ]);
+    const rawTopTracks = (top.data || []).map(t => fmtTrack(t));
+    const topTracks    = await enrichTracksWithStreams(rawTopTracks);
+    res.json({
+      id:         `dz_${artist.id}`,
+      name:       artist.name,
+      artworkURL: artist.picture_xl || artist.picture_big,
+      genres:     [],
+      bio:        '',
+      topTracks,
+      albums:     (albums.data || []).map(fmtAlbum),
+    });
+  } catch (err) {
+    console.error('[artist]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Playlist details ─────────────────────────────────────────
+app.get('/playlist/:id', async (req, res) => {
+  const rawId = req.params.id.replace(/^dz_/, '');
+  try {
+    const pl        = await deezerGet(`/playlist/${rawId}`);
+    const rawTracks = (pl.tracks?.data || []).map(t => fmtTrack(t));
+    const tracks    = await enrichTracksWithStreams(rawTracks);
+    res.json({
+      id:          `dz_${pl.id}`,
+      title:       pl.title,
+      description: pl.description || '',
+      artworkURL:  pl.picture_xl || pl.picture_big,
+      creator:     pl.creator?.name || '',
+      tracks,
+    });
+  } catch (err) {
+    console.error('[playlist]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Health check ─────────────────────────────────────────────
+app.get('/health', async (req, res) => {
+  let claudoOk = false, error = null;
+  try {
+    if (!CLAUDO_URL || !CLAUDO_TOKEN) throw new Error('CLAUDOCHROME_URL or CLAUDOCHROME_TOKEN not set');
+    await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
+    claudoOk = true;
+  } catch (e) { error = e.message; }
+  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.5.0' });
+});
+
+// ─── Start ────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`Deezer v5.5.0 → http://localhost:${PORT}`);
+  console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
+
+  if (process.env.RENDER_EXTERNAL_URL) {
+    const selfUrl = process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
+    setInterval(async () => {
+      try {
+        await axios.get(`${selfUrl}/health`, { timeout: 5000 });
+        console.log('[keepalive] ping ok');
+      } catch (e) {
+        console.warn('[keepalive] ping failed:', e.message);
+      }
+    }, 4 * 60 * 1000);
+  }
+});

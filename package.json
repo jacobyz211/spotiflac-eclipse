@@ -1,18 +1,16 @@
 {
-  "name": "spotiflac",
-  "version": "5.0.0",
-  "description": "Eclipse Music addon — Deezer search + TIDAL FLAC via Claudochrome",
-  "main": "index.js",
+  "name": "spotiflac-eclipse",
+  "version": "5.5.0",
+  "description": "SpotiFLAC — Deezer search + Claudochrome FLAC streams for Eclipse",
+  "private": true,
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "axios": "^1.7.2",
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "hono": "^4.4.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.57.0"
   }
 }

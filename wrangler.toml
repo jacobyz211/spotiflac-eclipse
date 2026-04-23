@@ -1,0 +1,9 @@
+name = "spotiflac-eclipse"
+main = "index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Required — set these as secrets:
+#   wrangler secret put CLAUDOCHROME_URL    (e.g. https://eclipse2.cyrusna29.workers.dev)
+#   wrangler secret put CLAUDOCHROME_TOKEN  (your 28-char token from the monochrome addon)

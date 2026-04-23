@@ -1,39 +1,44 @@
-const express = require('express');
-const cors    = require('cors');
-const axios   = require('axios');
+// SpotiFLAC — Deezer search + Claudochrome FLAC streams
+// Cloudflare Workers (Hono) — no Node.js APIs
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
-const DZ   = 'https://api.deezer.com';
+const app = new Hono();
+app.use('*', cors());
 
-const CLAUDO_URL   = (process.env.CLAUDOCHROME_URL   || '').replace(/\/$/, '');
-const CLAUDO_TOKEN = (process.env.CLAUDOCHROME_TOKEN  || '');
+// ─── In-memory caches (per isolate) ──────────────────────────────────────────
+const trackMetaCache = new Map(); // dzId → { title, artist }
+const tidalIdCache   = new Map(); // dzId → { tidalId, expiresAt }
+const streamCache    = new Map(); // dzId → { url, format, quality, expiresAt }
 
-app.use(cors());
-app.use(express.json());
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 
-// ─── Deezer helper ────────────────────────────────────────────
-async function deezerGet(endpoint, params = {}) {
-  const res = await axios.get(`${DZ}${endpoint}`, { params, timeout: 10000 });
-  if (res.data?.error) throw new Error(`Deezer: ${res.data.error.message}`);
-  return res.data;
+async function httpGet(url, params, timeout) {
+  const u = new URL(url);
+  if (params) Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, String(v)));
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout || 10000);
+  try {
+    const r = await fetch(u.toString(), {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+      signal: ctrl.signal
+    });
+    clearTimeout(timer);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  } catch (e) { clearTimeout(timer); throw e; }
 }
 
-// ─── Claudochrome helpers ─────────────────────────────────────
-function claudoBase() {
-  if (!CLAUDO_URL)   throw new Error('CLAUDOCHROME_URL env var not set.');
-  if (!CLAUDO_TOKEN) throw new Error('CLAUDOCHROME_TOKEN env var not set.');
-  return `${CLAUDO_URL}/u/${CLAUDO_TOKEN}`;
+function claudoBase(env) {
+  const url   = (env.CLAUDOCHROME_URL   || '').replace(/\/$/, '');
+  const token = (env.CLAUDOCHROME_TOKEN || '');
+  if (!url)   throw new Error('CLAUDOCHROME_URL env var not set.');
+  if (!token) throw new Error('CLAUDOCHROME_TOKEN env var not set.');
+  return url + '/u/' + token;
 }
 
-// Cache: deezerTrackId → { title, artist }
-const trackMetaCache = new Map();
-// Cache: deezerTrackId → { tidalId, expiresAt }
-const tidalIdCache   = new Map();
-// Cache: deezerTrackId → { url, format, quality, expiresAt }
-const streamCache    = new Map();
-
-// ─── Match scoring ────────────────────────────────────────────
+// ─── Match scoring ────────────────────────────────────────────────────────────
 function normStr(s) {
   return String(s || '').toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
 }
@@ -41,82 +46,64 @@ function normStr(s) {
 function strScore(a, b) {
   a = normStr(a); b = normStr(b);
   if (!a || !b) return 0;
-  if (a === b) return 1;
+  if (a === b)  return 1;
   if (a.includes(b) || b.includes(a)) return 0.85;
   const sa = new Set(a.split(' ')), sb = new Set(b.split(' '));
   const inter = [...sa].filter(w => w.length > 1 && sb.has(w)).length;
   return inter / Math.max(new Set([...sa, ...sb]).size, 1);
 }
 
-// Fix 1: don't duplicate artist words already present in the title.
-// "Hi Ren" + "Ren"  → query "Hi Ren"       (not "Hi Ren Ren")
-// "Hello"  + "Adele" → query "Hello Adele"  (normal)
 function buildSearchQuery(title, artist) {
-  const titleNorm  = normStr(title);
+  const titleNorm   = normStr(title);
   const artistWords = normStr(artist).split(' ').filter(w => w.length > 1);
   const allInTitle  = artistWords.length > 0 && artistWords.every(w => titleNorm.includes(w));
-  return allInTitle ? title : `${title} ${artist}`.trim();
+  return allInTitle ? title : (title + ' ' + artist).trim();
 }
 
-// Fix 2: require a minimum title score so a same-artist/wrong-title
-// result (score driven purely by artist) can never win.
 function bestTidalMatch(tracks, title, artist) {
   if (!tracks.length) return null;
   let best = null, bestScore = -1;
   for (const t of tracks) {
     const titleScore = strScore(t.title, title);
-    if (titleScore < 0.15) continue;                         // ← reject if title doesn't match at all
+    if (titleScore < 0.15) continue;
     const score = titleScore * 0.4 + strScore(t.artist, artist) * 0.6;
     if (score > bestScore) { bestScore = score; best = t; }
   }
-  if (best) console.log(`[tidal-match] best ${bestScore.toFixed(3)} → "${best.title}" by "${best.artist}"`);
   return bestScore >= 0.25 ? best : null;
 }
 
-async function getTidalId(dzId, title, artist) {
+async function getTidalId(env, dzId, title, artist) {
   const cached = tidalIdCache.get(dzId);
   if (cached && cached.expiresAt > Date.now()) return cached.tidalId;
-
-  const q   = buildSearchQuery(title, artist);              // ← smart query, no duplicates
-  console.log(`[tidal-search] query: "${q}"`);
-  const res = await axios.get(`${claudoBase()}/search`, {
-    params:  { q, limit: 10 },
-    timeout: 12000,
-  });
-
-  const tracks = res.data?.tracks || [];
-  if (!tracks.length) throw new Error(`Claudochrome: no results for "${q}"`);
-
+  const q      = buildSearchQuery(title, artist);
+  const base   = claudoBase(env);
+  const res    = await httpGet(base + '/search', { q, limit: 10 }, 12000);
+  const tracks = res?.tracks || [];
+  if (!tracks.length) throw new Error('Claudochrome: no results for "' + q + '"');
   const match = bestTidalMatch(tracks, title, artist);
-  if (!match) throw new Error(`Claudochrome: no confident match for "${title}" by "${artist}"`);
-
-  const tidalId = match.id;
-  tidalIdCache.set(dzId, { tidalId, expiresAt: Date.now() + 60 * 60 * 1000 });
-  console.log(`[tidal-match] "${title}" by "${artist}" → TIDAL id ${tidalId}`);
-  return tidalId;
+  if (!match) throw new Error('Claudochrome: no confident match for "' + title + '" by "' + artist + '"');
+  tidalIdCache.set(dzId, { tidalId: match.id, expiresAt: Date.now() + 3600000 });
+  return match.id;
 }
 
-async function resolveStream(dzId, title, artist) {
+async function resolveStream(env, dzId, title, artist) {
   const cached = streamCache.get(dzId);
   if (cached && cached.expiresAt > Date.now()) return cached;
-
-  const tidalId  = await getTidalId(dzId, title, artist);
-  const res      = await axios.get(`${claudoBase()}/stream/${tidalId}`, { timeout: 12000 });
-  const data     = res.data;
-
-  if (!data?.url) throw new Error(`Claudochrome: no stream URL for TIDAL id ${tidalId}`);
-
+  const tidalId = await getTidalId(env, dzId, title, artist);
+  const base    = claudoBase(env);
+  const data    = await httpGet(base + '/stream/' + tidalId, {}, 12000);
+  if (!data?.url) throw new Error('Claudochrome: no stream URL for TIDAL id ' + tidalId);
   const result = {
     url:       data.url,
-    format:    data.format   || 'flac',
-    quality:   data.quality  || 'lossless',
-    expiresAt: data.expiresAt || Date.now() + 5 * 60 * 1000,
+    format:    data.format  || 'flac',
+    quality:   data.quality || 'lossless',
+    expiresAt: data.expiresAt || Date.now() + 300000
   };
   streamCache.set(dzId, result);
   return result;
 }
 
-// ─── Concurrency limiter ──────────────────────────────────────
+// ─── Concurrency limiter ──────────────────────────────────────────────────────
 function pLimit(concurrency) {
   let active = 0;
   const queue = [];
@@ -126,88 +113,60 @@ function pLimit(concurrency) {
     const { fn, resolve, reject } = queue.shift();
     fn().then(resolve, reject).finally(() => { active--; next(); });
   };
-  return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
+  return fn => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
 }
 
-// ─── Enrich detail-endpoint tracks with pre-resolved stream URLs ──
-async function enrichTracksWithStreams(tracks, concurrency = 3) {
-  const limit = pLimit(concurrency);
+async function enrichTracksWithStreams(env, tracks, concurrency) {
+  const limit = pLimit(concurrency || 3);
   return Promise.all(tracks.map(track =>
     limit(async () => {
       const dzId = track.id.replace(/^dz_/, '');
       try {
         const cached = streamCache.get(dzId);
-        if (cached && cached.expiresAt > Date.now()) {
-          return { ...track, streamURL: cached.url };
-        }
+        if (cached && cached.expiresAt > Date.now()) return { ...track, streamURL: cached.url };
         const meta = trackMetaCache.get(dzId);
         if (!meta) return track;
-
         const result = await Promise.race([
-          resolveStream(dzId, meta.title, meta.artist),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+          resolveStream(env, dzId, meta.title, meta.artist),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
         ]);
         return { ...track, streamURL: result.url };
-      } catch {
-        return track;
-      }
+      } catch { return track; }
     })
   ));
 }
 
-// ─── Format helpers ───────────────────────────────────────────
+// ─── Format helpers ───────────────────────────────────────────────────────────
 function fmtTrack(t, albumName, albumCover) {
   const dzId = String(t.id);
   if (!trackMetaCache.has(dzId)) {
-    trackMetaCache.set(dzId, {
-      title:  t.title,
-      artist: t.artist?.name || '',
-    });
+    trackMetaCache.set(dzId, { title: t.title, artist: t.artist?.name || '' });
   }
   return {
-    id:         `dz_${t.id}`,
+    id:         'dz_' + t.id,
     title:      t.title,
     artist:     t.artist?.name || '',
     album:      t.album?.title || albumName || '',
     duration:   t.duration,
     artworkURL: t.album?.cover_xl || t.album?.cover_big || albumCover || undefined,
     isrc:       t.isrc || undefined,
-    format:     'flac',
+    format:     'flac'
   };
 }
 
 function fmtAlbum(a) {
-  return {
-    id:         `dz_${a.id}`,
-    title:      a.title,
-    artist:     a.artist?.name || '',
-    artworkURL: a.cover_xl || a.cover_big || undefined,
-    trackCount: a.nb_tracks,
-    year:       a.release_date?.slice(0, 4),
-  };
+  return { id: 'dz_' + a.id, title: a.title, artist: a.artist?.name || '', artworkURL: a.cover_xl || a.cover_big || undefined, trackCount: a.nb_tracks, year: a.release_date?.slice(0, 4) };
 }
 
 function fmtArtist(a) {
-  return {
-    id:         `dz_${a.id}`,
-    name:       a.name,
-    artworkURL: a.picture_xl || a.picture_big || undefined,
-    genres:     [],
-  };
+  return { id: 'dz_' + a.id, name: a.name, artworkURL: a.picture_xl || a.picture_big || undefined, genres: [] };
 }
 
 function fmtPlaylist(p) {
-  return {
-    id:          `dz_${p.id}`,
-    title:       p.title,
-    creator:     p.user?.name || p.creator?.name || '',
-    artworkURL:  p.picture_xl || p.picture_big || undefined,
-    trackCount:  p.nb_tracks,
-    description: p.description || '',
-  };
+  return { id: 'dz_' + p.id, title: p.title, creator: p.user?.name || p.creator?.name || '', artworkURL: p.picture_xl || p.picture_big || undefined, trackCount: p.nb_tracks, description: p.description || '' };
 }
 
-// ─── Website ──────────────────────────────────────────────────
+// ─── Config page HTML ─────────────────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -298,174 +257,137 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// ─── Routes ───────────────────────────────────────────────────
-app.get('/', (req, res) => res.type('html').send(HTML));
+// ─── Routes ───────────────────────────────────────────────────────────────────
+app.get('/', c => c.html(HTML));
 
-app.get('/manifest.json', (req, res) => {
-  const ua    = (req.headers['user-agent'] || '').toLowerCase();
-  const isiOS = /cfnetwork|darwin|iphone|ipad|ipod/.test(ua);
-
-  const resources = isiOS
-    ? ['search', 'stream', 'catalog']
-    : [{ name: 'search' }, { name: 'stream' }, { name: 'catalog' }];
-
-  const types = isiOS
-    ? ['track', 'album', 'artist', 'playlist']
-    : [{ name: 'track' }, { name: 'album' }, { name: 'artist' }, { name: 'playlist' }];
-
-  res.json({
+app.get('/manifest.json', c => {
+  return c.json({
     id:          'com.spotiflac.eclipse',
     name:        'ClaudiFLAC',
     version:     '5.5.0',
     description: 'Deezer search + TIDAL FLAC via Claudochrome',
     icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTVEu2Vv2QFKNF9ogOI2kI36dpX3whid9Zr4lvx7bsZAA&s=10',
-    resources,
-    types,
+    resources:   ['search', 'stream', 'catalog'],
+    types:       ['track', 'album', 'artist', 'playlist']
   });
 });
 
-app.get('/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
+app.get('/search', async c => {
+  const q = (c.req.query('q') || '').trim();
+  if (!q) return c.json({ tracks: [], albums: [], artists: [], playlists: [] });
   try {
+    const DZ = 'https://api.deezer.com';
     const [tr, al, ar, pl] = await Promise.allSettled([
-      deezerGet('/search',          { q, limit: 20 }),
-      deezerGet('/search/album',    { q, limit: 10 }),
-      deezerGet('/search/artist',   { q, limit: 10 }),
-      deezerGet('/search/playlist', { q, limit: 10 }),
+      httpGet(DZ + '/search',          { q, limit: 20 }),
+      httpGet(DZ + '/search/album',    { q, limit: 10 }),
+      httpGet(DZ + '/search/artist',   { q, limit: 10 }),
+      httpGet(DZ + '/search/playlist', { q, limit: 10 })
     ]);
-    res.json({
+    return c.json({
       tracks:    tr.status === 'fulfilled' ? (tr.value.data || []).map(t => fmtTrack(t)) : [],
       albums:    al.status === 'fulfilled' ? (al.value.data || []).map(fmtAlbum)         : [],
       artists:   ar.status === 'fulfilled' ? (ar.value.data || []).map(fmtArtist)        : [],
-      playlists: pl.status === 'fulfilled' ? (pl.value.data || []).map(fmtPlaylist)      : [],
+      playlists: pl.status === 'fulfilled' ? (pl.value.data || []).map(fmtPlaylist)      : []
     });
-  } catch (err) {
-    console.error('[search]', err.message);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-// ─── Stream resolution ────────────────────────────────────────
-app.get('/stream/:id', async (req, res) => {
-  const dzId = req.params.id.replace(/^dz_/, '');
+app.get('/stream/:id', async c => {
+  const dzId = c.req.param('id').replace(/^dz_/, '');
   try {
     let title, artist;
-
     const metaCached = trackMetaCache.get(dzId);
     if (metaCached) {
       ({ title, artist } = metaCached);
     } else {
-      const track = await deezerGet(`/track/${dzId}`);
+      const track = await httpGet('https://api.deezer.com/track/' + dzId);
       title  = track.title;
       artist = track.artist?.name || '';
       trackMetaCache.set(dzId, { title, artist });
     }
-
-    const result = await resolveStream(dzId, title, artist);
-    res.json(result);
-  } catch (err) {
-    console.error('[stream]', err.message);
-    res.status(500).json({ error: err.message });
+    const result = await resolveStream(c.env, dzId, title, artist);
+    return c.json(result);
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-// ─── Album details ────────────────────────────────────────────
-app.get('/album/:id', async (req, res) => {
-  const rawId = req.params.id.replace(/^dz_/, '');
+app.get('/album/:id', async c => {
+  const rawId = c.req.param('id').replace(/^dz_/, '');
   try {
-    const album     = await deezerGet(`/album/${rawId}`);
+    const album     = await httpGet('https://api.deezer.com/album/' + rawId);
     const cover     = album.cover_xl || album.cover_big;
     const rawTracks = (album.tracks?.data || []).map(t => fmtTrack(t, album.title, cover));
-    const tracks    = await enrichTracksWithStreams(rawTracks);
-    res.json({
-      id:          `dz_${album.id}`,
+    const tracks    = await enrichTracksWithStreams(c.env, rawTracks);
+    return c.json({
+      id:          'dz_' + album.id,
       title:       album.title,
       artist:      album.artist?.name || '',
       artworkURL:  cover,
       year:        album.release_date?.slice(0, 4),
       description: album.label || '',
       trackCount:  album.nb_tracks,
-      tracks,
+      tracks
     });
-  } catch (err) {
-    console.error('[album]', err.message);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-// ─── Artist details ───────────────────────────────────────────
-app.get('/artist/:id', async (req, res) => {
-  const rawId = req.params.id.replace(/^dz_/, '');
+app.get('/artist/:id', async c => {
+  const rawId = c.req.param('id').replace(/^dz_/, '');
   try {
+    const DZ = 'https://api.deezer.com';
     const [artist, top, albums] = await Promise.all([
-      deezerGet(`/artist/${rawId}`),
-      deezerGet(`/artist/${rawId}/top`,    { limit: 20 }),
-      deezerGet(`/artist/${rawId}/albums`, { limit: 20 }),
+      httpGet(DZ + '/artist/' + rawId),
+      httpGet(DZ + '/artist/' + rawId + '/top',    { limit: 20 }),
+      httpGet(DZ + '/artist/' + rawId + '/albums', { limit: 20 })
     ]);
     const rawTopTracks = (top.data || []).map(t => fmtTrack(t));
-    const topTracks    = await enrichTracksWithStreams(rawTopTracks);
-    res.json({
-      id:         `dz_${artist.id}`,
+    const topTracks    = await enrichTracksWithStreams(c.env, rawTopTracks);
+    return c.json({
+      id:         'dz_' + artist.id,
       name:       artist.name,
       artworkURL: artist.picture_xl || artist.picture_big,
       genres:     [],
       bio:        '',
       topTracks,
-      albums:     (albums.data || []).map(fmtAlbum),
+      albums:     (albums.data || []).map(fmtAlbum)
     });
-  } catch (err) {
-    console.error('[artist]', err.message);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-// ─── Playlist details ─────────────────────────────────────────
-app.get('/playlist/:id', async (req, res) => {
-  const rawId = req.params.id.replace(/^dz_/, '');
+app.get('/playlist/:id', async c => {
+  const rawId = c.req.param('id').replace(/^dz_/, '');
   try {
-    const pl        = await deezerGet(`/playlist/${rawId}`);
+    const pl        = await httpGet('https://api.deezer.com/playlist/' + rawId);
     const rawTracks = (pl.tracks?.data || []).map(t => fmtTrack(t));
-    const tracks    = await enrichTracksWithStreams(rawTracks);
-    res.json({
-      id:          `dz_${pl.id}`,
+    const tracks    = await enrichTracksWithStreams(c.env, rawTracks);
+    return c.json({
+      id:          'dz_' + pl.id,
       title:       pl.title,
       description: pl.description || '',
       artworkURL:  pl.picture_xl || pl.picture_big,
       creator:     pl.creator?.name || '',
-      tracks,
+      tracks
     });
-  } catch (err) {
-    console.error('[playlist]', err.message);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-// ─── Health check ─────────────────────────────────────────────
-app.get('/health', async (req, res) => {
+app.get('/health', async c => {
   let claudoOk = false, error = null;
   try {
-    if (!CLAUDO_URL || !CLAUDO_TOKEN) throw new Error('CLAUDOCHROME_URL or CLAUDOCHROME_TOKEN not set');
-    await axios.get(`${CLAUDO_URL}/u/${CLAUDO_TOKEN}/search`, { params: { q: 'test', limit: 1 }, timeout: 6000 });
+    const base = claudoBase(c.env);
+    await httpGet(base + '/search', { q: 'test', limit: 1 }, 6000);
     claudoOk = true;
   } catch (e) { error = e.message; }
-  res.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.5.0' });
+  return c.json({ status: claudoOk ? 'ok' : 'degraded', claudochrome: claudoOk, error, version: '5.5.0' });
 });
 
-// ─── Start ────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`SpotiFLAC v5.5.0 → http://localhost:${PORT}`);
-  console.log(`Claudochrome: ${CLAUDO_URL || '⚠  CLAUDOCHROME_URL not set'}`);
-
-  if (process.env.RENDER_EXTERNAL_URL) {
-    const selfUrl = process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '');
-    setInterval(async () => {
-      try {
-        await axios.get(`${selfUrl}/health`, { timeout: 5000 });
-        console.log('[keepalive] ping ok');
-      } catch (e) {
-        console.warn('[keepalive] ping failed:', e.message);
-      }
-    }, 4 * 60 * 1000);
-  }
-});
+export default app;
